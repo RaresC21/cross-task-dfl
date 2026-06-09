@@ -1,0 +1,216 @@
+"""
+Train demand prediction model and evaluate two-stage allocation cost.
+
+Training loss: MSE on demand predictions (fit demand first).
+Evaluation:    realized cost with Stage-2 QP for optimal shipments.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from data import generate_data, evaluate_cost_np, unpack_task, task_dim
+
+
+def seed_everything(seed: int):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def train_demand_model(
+    model,
+    X_train: torch.Tensor,   # (n, x_dim)
+    D_train: torch.Tensor,   # (n, T, W)
+    lr: float = 1e-3,
+    batch_size: int = 64,
+    max_epochs: int = 2000,
+    patience: int = 20,
+    check_every: int = 10,
+    val_fraction: float = 0.2,
+    verbose: bool = True,
+):
+    """Train with MSE on demand predictions, patience-based early stopping."""
+    import copy
+
+    n_val = max(1, int(len(X_train) * val_fraction))
+    X_tr, D_tr = X_train[:-n_val], D_train[:-n_val]
+    X_val, D_val = X_train[-n_val:], D_train[-n_val:]
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loader = DataLoader(TensorDataset(X_tr, D_tr), batch_size=batch_size, shuffle=True)
+
+    best_val = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
+    no_improve = 0
+
+    for epoch in range(max_epochs):
+        model.train()
+        for x_b, d_b in loader:
+            opt.zero_grad()
+            loss = nn.functional.mse_loss(model(x_b), d_b)
+            loss.backward()
+            opt.step()
+
+        if (epoch + 1) % check_every == 0:
+            model.eval()
+            with torch.no_grad():
+                val_loss = nn.functional.mse_loss(model(X_val), D_val).item()
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = copy.deepcopy(model.state_dict())
+                no_improve = 0
+            else:
+                no_improve += 1
+            if verbose:
+                print(f"  epoch {epoch+1:4d}  val_mse={val_loss:.4f}  no_improve={no_improve}/{patience}")
+            if no_improve >= patience:
+                break
+
+    model.load_state_dict(best_state)
+    return epoch + 1
+
+
+@torch.no_grad()
+def predict_orders(model, X: torch.Tensor) -> np.ndarray:
+    """Return y = D_hat as numpy array (n, T, W)."""
+    model.eval()
+    return model(X).numpy()
+
+
+def evaluate(model, X: torch.Tensor, data: dict, task: np.ndarray) -> float:
+    """Predict orders from model, run Stage-2 QP, return mean cost."""
+    y = predict_orders(model, X)    # (n, T, W)
+    return evaluate_cost_np(y, data, task)
+
+
+def oracle_cost(data: dict, task: np.ndarray) -> float:
+    """
+    Oracle: knows true demand, orders exactly D[t,w] every period.
+    Stage-2 QP still runs (no cross-shipment needed since supply == demand).
+    """
+    y_oracle = data["D"].copy()     # (n, T, W)
+    return evaluate_cost_np(y_oracle, data, task)
+
+
+def naive_cost(data: dict, task: np.ndarray) -> float:
+    """Naive: order mean demand (scalar, ignores x and task)."""
+    mean_d = data["D"].mean()
+    y_naive = np.full_like(data["D"], mean_d)
+    return evaluate_cost_np(y_naive, data, task)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end (DFL) training — backprop through Stage-2 QP cost
+# ---------------------------------------------------------------------------
+
+def train_e2e(
+    model,
+    X_train: torch.Tensor,      # (n, x_dim)
+    D_train: torch.Tensor,      # (n, T, W)
+    C_net_train: torch.Tensor,  # (n, T, W, W)
+    task: np.ndarray,           # (task_dim(W),)
+    W: int,
+    lr: float = 1e-3,
+    batch_size: int = 32,
+    max_epochs: int = 500,
+    patience: int = 20,
+    check_every: int = 10,
+    val_fraction: float = 0.2,
+    verbose: bool = True,
+):
+    """
+    Train model by minimising the realised two-stage allocation cost.
+    Gradients flow back through the Stage-2 QPFunction (qpth).
+    """
+    import copy
+    from dfl import e2e_cost
+    from torch.utils.data import DataLoader, TensorDataset
+
+    n_val = max(1, int(len(X_train) * val_fraction))
+    X_tr, D_tr, C_tr = X_train[:-n_val], D_train[:-n_val], C_net_train[:-n_val]
+    X_val, D_val, C_val = X_train[-n_val:], D_train[-n_val:], C_net_train[-n_val:]
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loader = DataLoader(
+        TensorDataset(X_tr, D_tr, C_tr), batch_size=batch_size, shuffle=True
+    )
+
+    best_val = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
+    no_improve = 0
+
+    for epoch in range(max_epochs):
+        model.train()
+        for x_b, d_b, c_b in loader:
+            opt.zero_grad()
+            y_b = model(x_b)                         # (bs, T, W)
+            loss = e2e_cost(y_b, d_b, c_b, task, W)
+            loss.backward()
+            opt.step()
+
+        if (epoch + 1) % check_every == 0:
+            model.eval()
+            with torch.no_grad():
+                y_val = model(X_val)
+            val_cost = e2e_cost(y_val, D_val, C_val, task, W).item()
+            if val_cost < best_val - 1e-4:
+                best_val = val_cost
+                best_state = copy.deepcopy(model.state_dict())
+                no_improve = 0
+            else:
+                no_improve += 1
+            if verbose:
+                print(f"  epoch {epoch+1:4d}  val_cost={val_cost:.4f}  no_improve={no_improve}/{patience}")
+            if no_improve >= patience:
+                break
+
+    model.load_state_dict(best_state)
+    return epoch + 1
+
+
+# ---------------------------------------------------------------------------
+# Quick end-to-end demo
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import copy
+    from models import DemandModel
+
+    seed_everything(42)
+
+    T, W, x_dim = 4, 3, 8
+    # Keep small for the demo; real experiments should use n_sequences >= 200
+    data_train = generate_data(n_tasks=1, n_sequences=100, T=T, W=W, x_dim=x_dim, seed=42)
+    data_test  = generate_data(n_tasks=1, n_sequences=50, T=T, W=W, x_dim=x_dim, seed=77,
+                               W_true=data_train["W_true"])
+
+    X_train    = torch.tensor(data_train["X"],     dtype=torch.float32)
+    D_train    = torch.tensor(data_train["D"],     dtype=torch.float32)
+    C_tr       = torch.tensor(data_train["C_net"], dtype=torch.float32)
+    X_test     = torch.tensor(data_test["X"],      dtype=torch.float32)
+    C_te       = torch.tensor(data_test["C_net"],  dtype=torch.float32)
+    D_test_t   = torch.tensor(data_test["D"],      dtype=torch.float32)
+
+    task = data_train["tasks"][0]
+
+    # ---- MSE baseline -------------------------------------------------------
+    model_mse = DemandModel(x_dim, T, W)
+    print(f"Model params: {sum(p.numel() for p in model_mse.parameters())}")
+    print("\n=== MSE training ===")
+    ep = train_demand_model(model_mse, X_train, D_train, max_epochs=300, verbose=False)
+    print(f"Converged in {ep} epochs")
+
+    # ---- E2E (DFL) ----------------------------------------------------------
+    model_e2e = DemandModel(x_dim, T, W)
+    print("\n=== E2E (DFL) training ===")
+    ep2 = train_e2e(model_e2e, X_train, D_train, C_tr, task, W,
+                    max_epochs=100, patience=10, verbose=True)
+    print(f"Converged in {ep2} epochs")
+
+    # ---- Compare ------------------------------------------------------------
+    print(f"\n--- Cost evaluation (test set, same task) ---")
+    print(f"  Oracle cost : {oracle_cost(data_test, task):.4f}")
+    print(f"  Naive cost  : {naive_cost(data_test, task):.4f}")
+    print(f"  MSE model   : {evaluate(model_mse, X_test, data_test, task):.4f}")
+    print(f"  E2E model   : {evaluate(model_e2e, X_test, data_test, task):.4f}")
