@@ -101,6 +101,103 @@ def naive_cost(data: dict, task: np.ndarray = None) -> float:
 
 
 # ---------------------------------------------------------------------------
+# SAA (Sample Average Approximation) baseline
+# ---------------------------------------------------------------------------
+
+def saa_demand_model(
+    demand_model,
+    X_train: torch.Tensor,    # (n, x_dim)  — used to estimate residual σ
+    D_train: torch.Tensor,    # (n, T, W)
+    data_test: dict,
+    W: int,
+    n_saa_samples: int = 20,  # demand scenarios per sequence
+    inner_epochs: int = 50,
+    inner_lr: float = 1e-2,
+    verbose: bool = False,
+) -> float:
+    """
+    SAA baseline: two-stage predict-then-optimise.
+
+    Step 1 (statistical):  pretrained demand_model predicts mu(x) per sequence.
+                           Residual std sigma estimated from training data.
+    Step 2 (SAA):          for each test sequence i with task p_i:
+                             - draw S demand scenarios D_s ~ N(mu_i, sigma^2), clipped >= 0
+                             - draw S network cost scenarios C_s from p_i's mu_ship
+                             - optimise y_i = argmin_y (1/S) sum_s e2e_cost(y, D_s, C_s, p_i)
+                               via gradient descent through the Stage-2 QPFunction
+    Step 3 (evaluation):   apply y_i to the true realised (D_i, C_net_i).
+
+    This uses x (through mu), uses the task (through QP costs), but is NOT
+    trained end-to-end — the demand model and decision are decoupled.
+    """
+    from dfl import e2e_cost
+
+    T    = data_test["T"]
+    rng  = np.random.default_rng(0)
+
+    # --- estimate residual noise from training data --------------------------
+    demand_model.eval()
+    with torch.no_grad():
+        mu_train = demand_model(X_train).numpy()   # (n, T, W)
+    residuals = D_train.numpy() - mu_train         # (n, T, W)
+    sigma = residuals.std(axis=(0, 1))             # (W,) per-warehouse std
+
+    # --- per-sequence SAA optimisation on test set ---------------------------
+    n_test = data_test["D"].shape[0]
+    X_te   = torch.tensor(data_test["X"],      dtype=torch.float32)
+    P_te   = torch.tensor(data_test["task_vecs"], dtype=torch.float32)
+
+    demand_model.eval()
+    with torch.no_grad():
+        mu_test = demand_model(X_te).numpy()       # (n_test, T, W)
+
+    _, _, _, mu_ship_all = zip(*[
+        __import__('data').unpack_task(data_test["task_vecs"][i], W)
+        for i in range(n_test)
+    ])
+
+    y_decisions = np.zeros((n_test, T, W))
+
+    for i in range(n_test):
+        mu_i = mu_test[i]                          # (T, W)
+        p_i  = P_te[i].unsqueeze(0)               # (1, task_dim)
+
+        # Draw S demand scenarios
+        noise    = rng.standard_normal((n_saa_samples, T, W)) * sigma
+        D_saa    = np.maximum(0.0, mu_i[np.newaxis] + noise)   # (S, T, W)
+
+        # Draw S network cost scenarios from task i's mu_ship
+        from data import unpack_task, mu_ship_to_matrix
+        _, _, _, mu_ship_i = unpack_task(data_test["task_vecs"][i], W)
+        mu_mat_i = mu_ship_to_matrix(mu_ship_i, W)             # (W, W)
+        log_noise = rng.normal(0, 0.2, (n_saa_samples, T, W, W))
+        C_saa    = mu_mat_i[np.newaxis, np.newaxis] * np.exp(log_noise)
+        for w in range(W):
+            C_saa[:, :, w, w] = 0.0
+
+        D_s = torch.tensor(D_saa, dtype=torch.float32)
+        C_s = torch.tensor(C_saa, dtype=torch.float32)
+        P_s = p_i.expand(n_saa_samples, -1)       # (S, task_dim)
+
+        # Optimise y_i: shape (T, W), constant across scenarios
+        y_i = torch.tensor(mu_i, dtype=torch.float32).requires_grad_(True)
+        opt = torch.optim.Adam([y_i], lr=inner_lr)
+
+        for ep in range(inner_epochs):
+            opt.zero_grad()
+            y_batch = torch.relu(y_i).unsqueeze(0).expand(n_saa_samples, -1, -1)
+            loss = e2e_cost(y_batch, D_s, C_s, P_s, W)
+            loss.backward()
+            opt.step()
+
+        y_decisions[i] = torch.relu(y_i).detach().numpy()
+        if verbose and (i % 10 == 0):
+            print(f"  seq {i}/{n_test}  saa_cost={loss.item():.4f}")
+
+    return evaluate_cost_np(y_decisions, data_test)
+
+
+# ---------------------------------------------------------------------------
 # End-to-end (DFL) training — backprop through Stage-2 QP cost
 # ---------------------------------------------------------------------------
 
@@ -214,42 +311,6 @@ if __name__ == "__main__":
     C_te  = to_t(data_test["C_net"])
     P_te  = to_t(data_test["task_vecs"])
 
-    EPOCHS  = 300
-    VERBOSE = True
-
-    # Helper: evaluate a trained model on test data
-    def eval_model(m, fwd):
-        m.eval()
-        with torch.no_grad():
-            y = fwd(m, X_te, P_te)
-        return evaluate_cost_np(y.numpy(), data_test)
-
-    def evaluate_cost_np_local(y_np, data):
-        from data import evaluate_cost_np as _ev
-        return _ev(y_np, data)
-
-    # ---- 1. Task-agnostic E2E  (ignores p) ----------------------------------
-    print("\n=== Task-Agnostic E2E (ignores task) ===")
-    m_agn = TaskAgnosticModel(x_dim, T, W)
-    fwd_agn = lambda m, x, p: m(x)
-    train_e2e(m_agn, X_tr, D_tr, C_tr, P_tr, W,
-              forward_fn=fwd_agn, max_epochs=EPOCHS, verbose=VERBOSE)
-
-    # ---- 2. Concat E2E  ([x, p] → y) ----------------------------------------
-    print("\n=== Concat E2E (flat task conditioning) ===")
-    m_cat = ConcatModel(x_dim, td, T, W)
-    fwd_cat = lambda m, x, p: m(x, p)
-    train_e2e(m_cat, X_tr, D_tr, C_tr, P_tr, W,
-              forward_fn=fwd_cat, max_epochs=EPOCHS, verbose=VERBOSE)
-
-    # ---- 3. FiLM E2E  (paper approach: f(x;p) = t(r(x);p)) -----------------
-    print("\n=== FiLM E2E (paper: f(x;p) = t(r(x);p)) ===")
-    m_film = FiLMModel(x_dim, td, T, W)
-    fwd_film = lambda m, x, p: m(x, p)
-    train_e2e(m_film, X_tr, D_tr, C_tr, P_tr, W,
-              forward_fn=fwd_film, max_epochs=EPOCHS, verbose=VERBOSE)
-
-    # ---- Results ------------------------------------------------------------
     from data import evaluate_cost_np as _ev_np
 
     def ev(m, fwd):
@@ -258,9 +319,40 @@ if __name__ == "__main__":
             y = fwd(m, X_te, P_te)
         return _ev_np(y.numpy(), data_test)
 
-    print(f"\n{'='*50}")
-    print(f"  Oracle (per-seq task-optimal) : {oracle_cost(data_test):.4f}")
-    print(f"  Naive  (mean demand, ignore x): {naive_cost(data_test):.4f}")
-    print(f"  Task-Agnostic E2E             : {ev(m_agn,  fwd_agn):.4f}")
-    print(f"  Concat E2E                    : {ev(m_cat,  fwd_cat):.4f}")
-    print(f"  FiLM E2E  (paper)             : {ev(m_film, fwd_film):.4f}")
+    # ---- 1. Task-agnostic E2E  (ignores p) ----------------------------------
+    print("\n=== Task-Agnostic E2E (ignores task) ===")
+    m_agn   = TaskAgnosticModel(x_dim, T, W)
+    fwd_agn = lambda m, x, p: m(x)
+    train_e2e(m_agn, X_tr, D_tr, C_tr, P_tr, W,
+              forward_fn=fwd_agn, max_epochs=300, verbose=True)
+
+    # ---- 2. Concat E2E  ([x, p] → y) ----------------------------------------
+    print("\n=== Concat E2E (flat task conditioning) ===")
+    m_cat   = ConcatModel(x_dim, td, T, W)
+    fwd_cat = lambda m, x, p: m(x, p)
+    train_e2e(m_cat, X_tr, D_tr, C_tr, P_tr, W,
+              forward_fn=fwd_cat, max_epochs=300, verbose=True)
+
+    # ---- 3. FiLM E2E  (paper approach: f(x;p) = t(r(x);p)) -----------------
+    print("\n=== FiLM E2E (paper: f(x;p) = t(r(x);p)) ===")
+    m_film   = FiLMModel(x_dim, td, T, W)
+    fwd_film = lambda m, x, p: m(x, p)
+    train_e2e(m_film, X_tr, D_tr, C_tr, P_tr, W,
+              forward_fn=fwd_film, max_epochs=1000, patience=30, verbose=True)
+
+    # ---- 4. SAA: predict demand distribution, then optimise over scenarios ---
+    print("\n=== SAA (predict mu(x), optimise y over demand scenarios) ===")
+    # Reuse a freshly MSE-trained demand model as the predictor
+    from models import TaskAgnosticModel as _DemandModel
+    m_pred = _DemandModel(x_dim, T, W)
+    train_demand_model(m_pred, X_tr, D_tr, max_epochs=500, verbose=False)
+    saa_result = saa_demand_model(m_pred, X_tr, D_tr, data_test, W, verbose=True)
+
+    # ---- Results ------------------------------------------------------------
+    print(f"\n{'='*52}")
+    print(f"  Oracle (true demand + optimal QP)    : {oracle_cost(data_test):.4f}")
+    print(f"  SAA    (predict mu(x), opt scenarios): {saa_result:.4f}")
+    print(f"  FiLM E2E  (paper: f(x;p)=t(r(x);p)): {ev(m_film, fwd_film):.4f}")
+    print(f"  Concat E2E  ([x,p]->y)             : {ev(m_cat,  fwd_cat):.4f}")
+    print(f"  Task-Agnostic E2E  (no p)          : {ev(m_agn,  fwd_agn):.4f}")
+    print(f"  Naive  (mean demand, ignore all)   : {naive_cost(data_test):.4f}")
