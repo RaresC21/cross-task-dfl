@@ -29,9 +29,16 @@ def train_demand_model(
     check_every: int = 10,
     val_fraction: float = 0.2,
     verbose: bool = True,
+    device: torch.device = None,
 ):
     """Train with MSE on demand predictions, patience-based early stopping."""
     import copy
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    X_train = X_train.to(device)
+    D_train = D_train.to(device)
 
     n_val = max(1, int(len(X_train) * val_fraction))
     X_tr, D_tr = X_train[:-n_val], D_train[:-n_val]
@@ -75,7 +82,8 @@ def train_demand_model(
 def predict_orders(model, X: torch.Tensor) -> np.ndarray:
     """Return y = D_hat as numpy array (n, T, W)."""
     model.eval()
-    return model(X).numpy()
+    device = next(model.parameters()).device
+    return model(X.to(device)).cpu().numpy()
 
 
 def evaluate(model, X: torch.Tensor, data: dict, task: np.ndarray = None) -> float:
@@ -114,6 +122,7 @@ def saa_demand_model(
     inner_epochs: int = 50,
     inner_lr: float = 1e-2,
     verbose: bool = False,
+    device: torch.device = None,
 ) -> float:
     """
     SAA baseline: two-stage predict-then-optimise.
@@ -132,13 +141,17 @@ def saa_demand_model(
     """
     from dfl import e2e_cost
 
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    demand_model = demand_model.to(device)
+
     T    = data_test["T"]
     rng  = np.random.default_rng(0)
 
     # --- estimate residual noise from training data --------------------------
     demand_model.eval()
     with torch.no_grad():
-        mu_train = demand_model(X_train).numpy()   # (n, T, W)
+        mu_train = demand_model(X_train.to(device)).cpu().numpy()   # (n, T, W)
     residuals = D_train.numpy() - mu_train         # (n, T, W)
     sigma = residuals.std(axis=(0, 1))             # (W,) per-warehouse std
 
@@ -149,7 +162,7 @@ def saa_demand_model(
 
     demand_model.eval()
     with torch.no_grad():
-        mu_test = demand_model(X_te).numpy()       # (n_test, T, W)
+        mu_test = demand_model(X_te.to(device)).cpu().numpy()  # (n_test, T, W)
 
     _, _, _, mu_ship_all = zip(*[
         __import__('data').unpack_task(data_test["task_vecs"][i], W)
@@ -175,12 +188,12 @@ def saa_demand_model(
         for w in range(W):
             C_saa[:, :, w, w] = 0.0
 
-        D_s = torch.tensor(D_saa, dtype=torch.float32)
-        C_s = torch.tensor(C_saa, dtype=torch.float32)
-        P_s = p_i.expand(n_saa_samples, -1)       # (S, task_dim)
+        D_s = torch.tensor(D_saa, dtype=torch.float32, device=device)
+        C_s = torch.tensor(C_saa, dtype=torch.float32, device=device)
+        P_s = p_i.to(device).expand(n_saa_samples, -1)   # (S, task_dim)
 
         # Optimise y_i: shape (T, W), constant across scenarios
-        y_i = torch.tensor(mu_i, dtype=torch.float32).requires_grad_(True)
+        y_i = torch.tensor(mu_i, dtype=torch.float32, device=device).requires_grad_(True)
         opt = torch.optim.Adam([y_i], lr=inner_lr)
 
         for ep in range(inner_epochs):
@@ -216,6 +229,7 @@ def train_e2e(
     check_every: int = 10,
     val_fraction: float = 0.2,
     verbose: bool = True,
+    device: torch.device = None,
 ):
     """
     Train model by minimising the realised two-stage allocation cost.
@@ -227,6 +241,14 @@ def train_e2e(
     import copy
     from dfl import e2e_cost
     from torch.utils.data import DataLoader, TensorDataset
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    X_train     = X_train.to(device)
+    D_train     = D_train.to(device)
+    C_net_train = C_net_train.to(device)
+    tasks_train = tasks_train.to(device)
 
     if forward_fn is None:
         forward_fn = lambda m, x, p: m(x)
@@ -274,3 +296,4 @@ def train_e2e(
     model.load_state_dict(best_state)
     return epoch + 1
 
+    

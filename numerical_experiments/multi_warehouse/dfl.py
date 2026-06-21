@@ -100,26 +100,28 @@ def e2e_cost(
     n_z    = n_ship + 2 * W
     edges  = _edge_order(W)
 
+    device = y.device
+
     # Per-sequence cost parameters
     c_b = tasks[:, :W].float()          # (batch, W) ordering cost
     h_b = tasks[:, W:2*W].float()       # (batch, W) holding cost
     b_b = tasks[:, 2*W:3*W].float()     # (batch, W) backlog cost
 
     # Q: (batch, n_z, n_z) — quadratic cost on S (h) and B (b), per sequence
-    q_diag = torch.zeros(batch, n_z, dtype=torch.float64)
+    q_diag = torch.zeros(batch, n_z, dtype=torch.float64, device=device)
     q_diag[:, n_ship:n_ship + W] = h_b.double()
     q_diag[:, n_ship + W:]       = b_b.double()
-    Q_b = torch.diag_embed(q_diag) + eps * torch.eye(n_z, dtype=torch.float64)
+    Q_b = torch.diag_embed(q_diag) + eps * torch.eye(n_z, dtype=torch.float64, device=device)
 
     # G / h_ineq: nonnegativity, same for all (expand to batch)
-    G_b  = (-torch.eye(n_z, dtype=torch.float64)
+    G_b  = (-torch.eye(n_z, dtype=torch.float64, device=device)
              .unsqueeze(0).expand(batch, -1, -1).contiguous())
-    hi_b = torch.zeros(batch, n_z, dtype=torch.float64)
+    hi_b = torch.zeros(batch, n_z, dtype=torch.float64, device=device)
 
     # A: inventory balance, same structure for all (expand to batch)
     A1   = build_stage2_matrices(W,
                                   torch.ones(W), torch.ones(W), eps=0.0)[3]  # (1,W,n_z)
-    A_b  = A1.expand(batch, -1, -1).contiguous()
+    A_b  = A1.to(device).expand(batch, -1, -1).contiguous()
 
     I = y.new_zeros(batch, W)
     total_cost = y.new_zeros(batch)
